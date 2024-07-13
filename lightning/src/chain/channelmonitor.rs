@@ -38,6 +38,8 @@ use crate::ln::msgs::DecodeError;
 use crate::ln::channel_keys::{DelayedPaymentKey, DelayedPaymentBasepoint, HtlcBasepoint, HtlcKey, RevocationKey, RevocationBasepoint};
 use crate::ln::chan_utils::{self,CommitmentTransaction, CounterpartyCommitmentSecrets, HTLCOutputInCommitment, HTLCClaim, ChannelTransactionParameters, HolderCommitmentTransaction, TxCreationKeys};
 use crate::ln::channelmanager::{HTLCSource, SentHTLCId};
+use crate::ln::our_peer_storage::StubChannelMonitor;
+use crate::ln::features::ChannelTypeFeatures;
 use crate::chain;
 use crate::chain::{BestBlock, WatchedOutput};
 use crate::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator, LowerBoundedFeeEstimator};
@@ -1530,6 +1532,19 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// ChannelMonitor.
 	pub fn get_latest_update_id(&self) -> u64 {
 		self.inner.lock().unwrap().get_latest_update_id()
+	}
+
+	/// Gets the latest claiming info from the ChannelMonitor to update our PeerStorageBackup.
+	pub(crate) fn get_latest_commitment_txn_and_its_claiming_info(&self) -> Option<(Txid, Vec<(HTLCOutputInCommitment, Option<std::boxed::Box<HTLCSource>>)>, Option<(u64, PublicKey, Option<PublicKey>)>)> {
+		let lock = self.inner.lock().unwrap();
+		if let Some(latest_txid) = lock.current_counterparty_commitment_txid {
+			return Some((
+				latest_txid, lock.counterparty_claimable_outpoints.get(&latest_txid).unwrap().clone(),
+				lock.their_cur_per_commitment_points
+			))
+		}
+ 
+		None
 	}
 
 	/// Gets the funding transaction outpoint of the channel this ChannelMonitor is monitoring for.

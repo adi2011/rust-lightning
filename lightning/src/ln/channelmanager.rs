@@ -40,13 +40,14 @@ use crate::blinded_path::payment::{BlindedPaymentPath, Bolt12OfferContext, Bolt1
 use crate::chain;
 use crate::chain::{Confirm, ChannelMonitorUpdateStatus, Watch, BestBlock};
 use crate::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator, LowerBoundedFeeEstimator};
-use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, WithChannelMonitor, ChannelMonitorUpdateStep, HTLC_FAIL_BACK_BUFFER, CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS, ANTI_REORG_DELAY, MonitorEvent, CLOSED_CHANNEL_UPDATE_ID};
+use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, MonitorEvent, WithChannelMonitor, ANTI_REORG_DELAY, CLOSED_CHANNEL_UPDATE_ID, CLTV_CLAIM_BUFFER, HTLC_FAIL_BACK_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS, STUB_CHANNEL_UPDATE_IDENTIFIER};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::events;
 use crate::events::{Event, EventHandler, EventsProvider, MessageSendEvent, MessageSendEventsProvider, ClosureReason, HTLCDestination, PaymentFailureReason, ReplayEvent};
 // Since this struct is returned in `list_channels` methods, expose it here in case users want to
 // construct one themselves.
 use crate::ln::inbound_payment;
+use crate::ln::our_peer_storage::{OurPeerStorage, StubChannelMonitor};
 use crate::ln::types::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::ln::channel::{self, Channel, ChannelPhase, ChannelContext, ChannelError, ChannelUpdateStatus, ShutdownResult, UnfundedChannelContext, UpdateFulfillCommitFetch, OutboundV1Channel, InboundV1Channel, WithChannelContext};
 use crate::ln::channel_state::ChannelDetails;
@@ -6876,6 +6877,8 @@ where
 								if let Some(raa_blocker) = raa_blocker_opt {
 									peer_state.actions_blocking_raa_monitor_updates.entry(chan_id).or_insert_with(Vec::new).push(raa_blocker);
 								}
+
+								let _ = self.our_peer_storage.write().unwrap().update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
 								if !during_init {
 									handle_new_monitor_update!(self, prev_hop.outpoint, monitor_update, peer_state_lock,
 										peer_state, per_peer_state, chan);
@@ -8015,7 +8018,18 @@ where
 						let mut pending_events = self.pending_events.lock().unwrap();
 						emit_channel_ready_event!(pending_events, chan);
 					}
-
+					// Update Peer Storage.
+					let counterparty_channel_parameters = chan.context.channel_transaction_parameters.counterparty_parameters.as_ref().unwrap();
+					let counterparty_delayed_payment_base_key = counterparty_channel_parameters.pubkeys.delayed_payment_basepoint;
+					let counterparty_htlc_base_key = counterparty_channel_parameters.pubkeys.htlc_basepoint;
+					let stub_chan = StubChannelMonitor::new(chan.context.channel_id(), chan.context.get_funding_txo().unwrap(), chan.context.get_value_satoshis(),
+																chan.context.get_channel_keys_id(), chan.context.get_commitment_secret(),
+																chan.context.get_counterparty_node_id(), counterparty_delayed_payment_base_key, counterparty_htlc_base_key,
+																chan.context.get_holder_selected_contest_delay(),
+																chan.context.get_commitment_txn_number_obscure_factor(), None,
+																None, chan.context.channel_transaction_parameters.channel_type_features.clone(),
+																self.current_best_block());
+					self.our_peer_storage.write().unwrap().stub_channel(stub_chan);
 					Ok(())
 				} else {
 					try_chan_phase_entry!(self, Err(ChannelError::close(
@@ -8363,6 +8377,7 @@ where
 					let funding_txo = chan.context.get_funding_txo();
 					let monitor_update_opt = try_chan_phase_entry!(self, chan.commitment_signed(&msg, &&logger), chan_phase_entry);
 					if let Some(monitor_update) = monitor_update_opt {
+						let _ = self.our_peer_storage.write().unwrap().update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
 						handle_new_monitor_update!(self, funding_txo.unwrap(), monitor_update, peer_state_lock,
 							peer_state, per_peer_state, chan);
 					}
@@ -8563,9 +8578,14 @@ where
 						} else { false };
 						let (htlcs_to_fail, monitor_update_opt) = try_chan_phase_entry!(self,
 							chan.revoke_and_ack(&msg, &self.fee_estimator, &&logger, mon_update_blocked), chan_phase_entry);
+
+						let mut our_peer_storage = self.our_peer_storage.write().unwrap();
 						if let Some(monitor_update) = monitor_update_opt {
 							let funding_txo = funding_txo_opt
 								.expect("Funding outpoint must have been set for RAA handling to succeed");
+
+							let _ = our_peer_storage.update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
+
 							handle_new_monitor_update!(self, funding_txo, monitor_update,
 								peer_state_lock, peer_state, per_peer_state, chan);
 						}
@@ -8909,6 +8929,7 @@ where
 						}
 						if let Some(monitor_update) = monitor_opt {
 							has_monitor_update = true;
+							let _ = self.our_peer_storage.write().unwrap().update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
 
 							handle_new_monitor_update!(self, funding_txo.unwrap(), monitor_update,
 								peer_state_lock, peer_state, per_peer_state, chan);
@@ -10146,7 +10167,7 @@ where
 			}
 			channel.best_block_updated(height, header.time, self.chain_hash, &self.node_signer, &self.default_configuration, &&WithChannelContext::from(&self.logger, &channel.context, None))
 		});
-
+		self.our_peer_storage.write().unwrap().update_best_block(header, height);
 		macro_rules! max_time {
 			($timestamp: expr) => {
 				loop {
@@ -12327,6 +12348,8 @@ where
 		let mut channel_closures = VecDeque::new();
 		let mut close_background_events = Vec::new();
 		let mut funding_txo_to_channel_id = hash_map_with_capacity(channel_count as usize);
+		let mut our_peer_storage: OurPeerStorage = OurPeerStorage::new();
+
 		for _ in 0..channel_count {
 			let mut channel: Channel<SP> = Channel::read(reader, (
 				&args.entropy_source, &args.signer_provider, best_block_height, &provided_channel_type_features(&args.default_config)
@@ -12335,7 +12358,38 @@ where
 			let funding_txo = channel.context.get_funding_txo().ok_or(DecodeError::InvalidValue)?;
 			funding_txo_to_channel_id.insert(funding_txo, channel.context.channel_id());
 			funding_txo_set.insert(funding_txo.clone());
+			let counterparty_channel_parameters = channel.context.channel_transaction_parameters.counterparty_parameters.as_ref().unwrap();
+			let counterparty_delayed_payment_base_key = counterparty_channel_parameters.pubkeys.delayed_payment_basepoint;
+			let counterparty_htlc_base_key = counterparty_channel_parameters.pubkeys.htlc_basepoint;
+
+			let stub_chan = StubChannelMonitor::new(
+				channel.context.channel_id(),
+				funding_txo,
+				channel.context.get_value_satoshis(),
+				channel.context.get_channel_keys_id(),
+				channel.context.get_commitment_secret(),
+				channel.context.get_counterparty_node_id(),
+				counterparty_delayed_payment_base_key,
+				counterparty_htlc_base_key,
+				channel.context.get_holder_selected_contest_delay(),
+				channel.context.get_commitment_txn_number_obscure_factor(),
+				None,
+				None,
+				channel.context.channel_transaction_parameters.channel_type_features.clone(),
+				BestBlock::new(best_block_hash.clone(), best_block_height.clone()),
+			);
+			our_peer_storage.stub_channel(stub_chan);
 			if let Some(ref mut monitor) = args.channel_monitors.get_mut(&funding_txo) {
+				if let Some(latest_commitment_txn_info) = monitor.get_latest_commitment_txn_and_its_claiming_info() {
+
+					our_peer_storage.update_latest_state(monitor.channel_id(), latest_commitment_txn_info.0, latest_commitment_txn_info.2);
+				}
+
+				if monitor.get_latest_update_id() == STUB_CHANNEL_UPDATE_IDENTIFIER {
+					log_error!(logger, "ChannelMonitor for {} is stale and recovered from Peer Storage, it is not safe to run the node in normal mode.", monitor.channel_id());
+					return Err(DecodeError::DangerousValue);
+				}
+
 				if channel.get_cur_holder_commitment_transaction_number() > monitor.get_cur_holder_commitment_number() ||
 						channel.get_revoked_counterparty_commitment_transaction_number() > monitor.get_min_seen_secret() ||
 						channel.get_cur_counterparty_commitment_transaction_number() > monitor.get_cur_counterparty_commitment_number() ||
