@@ -1440,6 +1440,13 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		})
 	}
 
+	pub(crate) fn merge_commitment_secret(&mut self, monitor: ChannelMonitor<Signer>) {
+		if self.get_min_seen_secret() > monitor.get_min_seen_secret() {
+			let inner = monitor.inner.lock().unwrap();
+			self.inner.lock().unwrap().commitment_secrets = inner.commitment_secrets.clone();
+		}
+	}
+
 	/// Returns a [`ChannelMonitor`] using [`StubChannelMonitor`] and other
 	/// important information to sweep funds and create penalty transactions.
 	pub(crate) fn new_stub(secp_ctx: Secp256k1<secp256k1::All>, stub_channel: &StubChannelMonitor, keys: Signer, channel_parameters: ChannelTransactionParameters ,funding_info_scriptbuf: ScriptBuf, destination_script: ScriptBuf) -> ChannelMonitor<Signer> {
@@ -1687,6 +1694,10 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 				});
 			}
 		}
+	}
+
+	pub fn update_latest_state_from_new_stubmonitor(&self, stub: &StubChannelMonitor) {
+		self.inner.lock().unwrap().update_latest_state_from_new_stubmonitor(stub);
 	}
 
 	/// Get the list of HTLCs who's status has been updated on chain. This should be called by
@@ -3532,13 +3543,14 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 		self.current_holder_commitment_number
 	}
 
-	/// Updates the [`StubChannelMonitor`] when we receive a new more recent
-	/// peer storage from our peer. This souldn't be called through [`ChannelMonitor`].
-	fn update_latest_state_from_new_stubchannelmonitor(&mut self, stub: &StubChannelMonitor<Signer>) {
-		let inner = stub.inner.lock().unwrap();
-		self.commitment_secrets = inner.commitment_secrets.clone();
-		self.counterparty_claimable_outpoints = inner.counterparty_claimable_outpoints.clone();
-		self.their_cur_per_commitment_points = inner.their_cur_per_commitment_points.clone();
+	/// Updates the [`ChannelMonitor`] when we receive a new more recent
+	/// peer storage from our peer.
+	fn update_latest_state_from_new_stubmonitor(&mut self, stub: &StubChannelMonitor) {
+		let mut latest_state = new_hash_map();
+		latest_state.insert(stub.latest_state.unwrap(), Vec::new());
+		self.commitment_secrets = stub.commitment_secrets.clone();
+		self.counterparty_claimable_outpoints = latest_state;
+		self.their_cur_per_commitment_points = stub.their_cur_per_commitment_points.clone();
 	}
 
 	/// Attempts to claim a counterparty commitment transaction's outputs using the revocation key and
