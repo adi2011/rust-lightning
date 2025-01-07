@@ -357,9 +357,7 @@ impl<'a, 'b, ES: EntropySource, SP: SignerProvider> ReadableArgs<(&'a ES, &'b SP
 		let signer_provider = args.1;
 		let channel_value_satoshis = args.2;
 		let channel_keys_id = args.3;
-
 		let _ver = read_ver_prefix!(reader, SERIALIZATION_VERSION);
-
 		let destination_script = Readable::read(reader)?;
 
 		let holder_commitment = Readable::read(reader)?;
@@ -464,6 +462,10 @@ impl<ChannelSigner: EcdsaChannelSigner> OnchainTxHandler<ChannelSigner> {
 			pending_claim_events: Vec::new(),
 			secp_ctx,
 		}
+	}
+
+	pub(crate) fn get_holder_commitment(&self) -> HolderCommitmentTransaction {
+		self.holder_commitment.clone()
 	}
 
 	pub(crate) fn get_prev_holder_commitment_to_self_value(&self) -> Option<u64> {

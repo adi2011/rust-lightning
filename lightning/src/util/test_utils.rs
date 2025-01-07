@@ -22,7 +22,7 @@ use crate::chain::channelmonitor::MonitorEvent;
 use crate::chain::transaction::OutPoint;
 use crate::routing::router::{CandidateRouteHop, FirstHopCandidate, PublicHopCandidate, PrivateHopCandidate};
 use crate::sign;
-use crate::events;
+use crate::events::{self, MessageSendEvent, MessageSendEventsProvider};
 use crate::events::bump_transaction::{WalletSource, Utxo};
 use crate::ln::types::ChannelId;
 use crate::ln::channel_state::ChannelDetails;
@@ -355,7 +355,7 @@ impl<'a> TestChainMonitor<'a> {
 			added_monitors: Mutex::new(Vec::new()),
 			monitor_updates: Mutex::new(new_hash_map()),
 			latest_monitor_update_id: Mutex::new(new_hash_map()),
-			chain_monitor: chainmonitor::ChainMonitor::new(chain_source, broadcaster, logger, fee_estimator, persister),
+			chain_monitor: chainmonitor::ChainMonitor::new(chain_source, broadcaster, logger, fee_estimator, persister, keys_manager.get_peer_storage_key()),
 			keys_manager,
 			expect_channel_force_closed: Mutex::new(None),
 			expect_monitor_round_trip_fail: Mutex::new(None),
@@ -731,6 +731,30 @@ impl chaininterface::BroadcasterInterface for TestBroadcaster {
 		}
 		let owned_txs: Vec<Transaction> = txs.iter().map(|tx| (*tx).clone()).collect();
 		self.txn_broadcasted.lock().unwrap().extend(owned_txs);
+	}
+}
+pub struct TestSendingOnlyMessageHandler {
+	pub pending_events: Mutex<Vec<events::MessageSendEvent>>,
+}
+impl TestSendingOnlyMessageHandler {
+	pub fn new() -> Self {
+		TestSendingOnlyMessageHandler {
+			pending_events: Mutex::new(Vec::new()),
+		}
+	}
+}
+
+impl MessageSendEventsProvider for TestSendingOnlyMessageHandler {
+	fn get_and_clear_pending_msg_events(&self) -> Vec<MessageSendEvent> {
+		let mut pending_events = self.pending_events.lock().unwrap();
+		let mut ret = Vec::new();
+		mem::swap(&mut ret, &mut *pending_events);
+		ret
+	}
+}
+impl msgs::SendingOnlyMessageHandler for TestSendingOnlyMessageHandler {
+	fn send_peer_storage(&self, their_node_id: PublicKey) {
+		self.pending_events.lock().unwrap().push(events::MessageSendEvent::SendPeerStorageMessage { node_id: their_node_id, msg: msgs::PeerStorageMessage{data: Vec::new()} })
 	}
 }
 
@@ -1195,6 +1219,10 @@ impl NodeSigner for TestNodeSigner {
 		unreachable!()
 	}
 
+	fn get_peer_storage_key(&self) -> [u8;32] {
+		unreachable!()
+	}
+
 	fn get_node_id(&self, recipient: Recipient) -> Result<PublicKey, ()> {
 		let node_secret = match recipient {
 			Recipient::Node => Ok(&self.node_secret),
@@ -1269,6 +1297,10 @@ impl NodeSigner for TestKeysInterface {
 
 	fn sign_invoice(&self, invoice: &RawBolt11Invoice, recipient: Recipient) -> Result<RecoverableSignature, ()> {
 		self.backing.sign_invoice(invoice, recipient)
+	}
+
+	fn get_peer_storage_key(&self) -> [u8;32] {
+		self.backing.get_peer_storage_key()
 	}
 
 	fn sign_bolt12_invoice_request(
@@ -1422,6 +1454,10 @@ impl TestChainSource {
 	pub fn remove_watched_txn_and_outputs(&self, outpoint: OutPoint, script_pubkey: ScriptBuf) {
 		self.watched_outputs.lock().unwrap().remove(&(outpoint, script_pubkey.clone()));
 		self.watched_txn.lock().unwrap().remove(&(outpoint.txid, script_pubkey));
+	}
+	pub fn clear_watched_txn_and_outputs(&self) {
+		self.watched_outputs.lock().unwrap().clear();
+		self.watched_txn.lock().unwrap().clear();
 	}
 }
 

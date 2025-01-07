@@ -1502,6 +1502,10 @@ pub struct CommitmentUpdate {
 	pub commitment_signed: CommitmentSigned,
 }
 
+pub trait SendingOnlyMessageHandler: MessageSendEventsProvider {
+	fn send_peer_storage(&self, their_node_id: PublicKey);
+}
+
 /// A trait to describe an object which can receive channel messages.
 ///
 /// Messages MAY be called in parallel when they originate from different `their_node_ids`, however

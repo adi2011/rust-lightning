@@ -1045,6 +1045,7 @@ impl Readable for Vec<Witness> {
 impl Writeable for ScriptBuf {
 	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
 		(self.len() as u16).write(w)?;
+		println!("len encoded is {}",self.len() as u16);
 		w.write_all(self.as_bytes())
 	}
 }
@@ -1053,6 +1054,7 @@ impl Readable for ScriptBuf {
 	fn read<R: Read>(r: &mut R) -> Result<Self, DecodeError> {
 		let len = <u16 as Readable>::read(r)? as usize;
 		let mut buf = vec![0; len];
+		println!("here as well {}", len);
 		r.read_exact(&mut buf)?;
 		Ok(ScriptBuf::from(buf))
 	}

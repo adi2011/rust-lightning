@@ -18,6 +18,7 @@
 //! imply it needs to fail HTLCs/payments/channels it manages).
 
 use bitcoin::block::Header;
+use bitcoin::hex::DisplayHex;
 use bitcoin::transaction::Transaction;
 use bitcoin::constants::ChainHash;
 use bitcoin::key::constants::SECRET_KEY_SIZE;
@@ -40,13 +41,14 @@ use crate::blinded_path::payment::{BlindedPaymentPath, Bolt12OfferContext, Bolt1
 use crate::chain;
 use crate::chain::{Confirm, ChannelMonitorUpdateStatus, Watch, BestBlock};
 use crate::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator, LowerBoundedFeeEstimator};
-use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, WithChannelMonitor, ChannelMonitorUpdateStep, HTLC_FAIL_BACK_BUFFER, CLTV_CLAIM_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS, ANTI_REORG_DELAY, MonitorEvent, CLOSED_CHANNEL_UPDATE_ID};
+use crate::chain::channelmonitor::{ChannelMonitor, ChannelMonitorUpdate, ChannelMonitorUpdateStep, MonitorEvent, WithChannelMonitor, get_stub_channel_info_from_ser_channel, ANTI_REORG_DELAY, CLOSED_CHANNEL_UPDATE_ID, CLTV_CLAIM_BUFFER, HTLC_FAIL_BACK_BUFFER, LATENCY_GRACE_PERIOD_BLOCKS, STUB_CHANNEL_UPDATE_IDENTIFIER};
 use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::events;
 use crate::events::{Event, EventHandler, EventsProvider, MessageSendEvent, MessageSendEventsProvider, ClosureReason, HTLCDestination, PaymentFailureReason, ReplayEvent};
 // Since this struct is returned in `list_channels` methods, expose it here in case users want to
 // construct one themselves.
 use crate::ln::inbound_payment;
+use crate::ln::our_peer_storage::{OurPeerStorage, StubChannelMonitor};
 use crate::ln::types::{ChannelId, PaymentHash, PaymentPreimage, PaymentSecret};
 use crate::ln::channel::{self, Channel, ChannelPhase, ChannelContext, ChannelError, ChannelUpdateStatus, ShutdownResult, UnfundedChannelContext, UpdateFulfillCommitFetch, OutboundV1Channel, InboundV1Channel, WithChannelContext};
 use crate::ln::channel_state::ChannelDetails;
@@ -76,8 +78,8 @@ use crate::offers::static_invoice::StaticInvoice;
 use crate::onion_message::async_payments::{AsyncPaymentsMessage, HeldHtlcAvailable, ReleaseHeldHtlc, AsyncPaymentsMessageHandler};
 use crate::onion_message::messenger::{Destination, MessageRouter, Responder, ResponseInstruction, MessageSendInstructions};
 use crate::onion_message::offers::{OffersMessage, OffersMessageHandler};
-use crate::sign::{EntropySource, NodeSigner, Recipient, SignerProvider};
 use crate::sign::ecdsa::EcdsaChannelSigner;
+use crate::sign::{EntropySource, ChannelSigner, NodeSigner, Recipient, SignerProvider};
 use crate::util::config::{UserConfig, ChannelConfig, ChannelConfigUpdate};
 use crate::util::wakers::{Future, Notifier};
 use crate::util::scid_utils::fake_scid;
@@ -1172,6 +1174,19 @@ pub(super) struct PeerState<SP: Deref> where SP::Target: SignerProvider {
 }
 
 impl <SP: Deref> PeerState<SP> where SP::Target: SignerProvider {
+	pub fn new(features: &InitFeatures) -> Self {
+		Self {
+			channel_by_id: new_hash_map(),
+			inbound_channel_request_by_id: new_hash_map(),
+			latest_features: features.clone(),
+			pending_msg_events: Vec::new(),
+			in_flight_monitor_updates: BTreeMap::new(),
+			monitor_update_blocked_actions: BTreeMap::new(),
+			actions_blocking_raa_monitor_updates: BTreeMap::new(),
+			is_connected: true,
+			peer_storage: Vec::new(),
+		}
+	}
 	/// Indicates that a peer meets the criteria where we're ok to remove it from our storage.
 	/// If true is passed for `require_disconnected`, the function will return false if we haven't
 	/// disconnected from the node already, ie. `PeerState::is_connected` is set to `true`.
@@ -2318,6 +2333,9 @@ where
 
 	inbound_payment_key: inbound_payment::ExpandedKey,
 
+	/// The key used to encrypt our peer storage that would be sent to our peers.
+	our_peerstorage_encryption_key: [u8;32],
+
 	/// LDK puts the [fake scids] that it generates into namespaces, to identify the type of an
 	/// incoming payment. To make it harder for a third-party to identify the type of a payment,
 	/// we encrypt the namespace identifier using these bytes.
@@ -2432,7 +2450,7 @@ where
 	entropy_source: ES,
 	node_signer: NS,
 	signer_provider: SP,
-
+	our_peer_storage: FairRwLock<OurPeerStorage>,
 	logger: L,
 }
 
@@ -3198,6 +3216,7 @@ where
 		secp_ctx.seeded_randomize(&entropy_source.get_secure_random_bytes());
 		let inbound_pmt_key_material = node_signer.get_inbound_payment_key_material();
 		let expanded_inbound_key = inbound_payment::ExpandedKey::new(&inbound_pmt_key_material);
+		let our_peerstorage_encryption_key = node_signer.get_peer_storage_key();
 		ChannelManager {
 			default_configuration: config.clone(),
 			chain_hash: ChainHash::using_genesis_block(params.network),
@@ -3223,6 +3242,8 @@ where
 			secp_ctx,
 
 			inbound_payment_key: expanded_inbound_key,
+			our_peerstorage_encryption_key,
+
 			fake_scid_rand_bytes: entropy_source.get_secure_random_bytes(),
 
 			probing_cookie_secret: entropy_source.get_secure_random_bytes(),
@@ -3250,7 +3271,7 @@ where
 			entropy_source,
 			node_signer,
 			signer_provider,
-
+			our_peer_storage: FairRwLock::new(OurPeerStorage::new()),
 			logger,
 		}
 	}
@@ -3258,6 +3279,13 @@ where
 	/// Gets the current configuration applied to all new channels.
 	pub fn get_current_default_configuration(&self) -> &UserConfig {
 		&self.default_configuration
+	}
+
+	/// Returns the encrypted [`OurPeerStorage`] which can be distributed among our peers.
+	/// We use a key derived from our seed to encrypt this.
+	pub fn get_encrypted_our_peer_storage(&self) -> Vec<u8> {
+		let our_peer_storage = self.our_peer_storage.read().unwrap();
+		our_peer_storage.encrypt_our_peer_storage(self.our_peerstorage_encryption_key)
 	}
 
 	fn create_and_insert_outbound_scid_alias(&self) -> u64 {
@@ -6863,6 +6891,8 @@ where
 								if let Some(raa_blocker) = raa_blocker_opt {
 									peer_state.actions_blocking_raa_monitor_updates.entry(chan_id).or_insert_with(Vec::new).push(raa_blocker);
 								}
+
+								// let _ = self.our_peer_storage.write().unwrap().update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
 								if !during_init {
 									handle_new_monitor_update!(self, prev_hop.outpoint, monitor_update, peer_state_lock,
 										peer_state, per_peer_state, chan);
@@ -7900,6 +7930,57 @@ where
 	}
 
 	fn internal_your_peer_storage(&self, counterparty_node_id: &PublicKey, msg: &msgs::YourPeerStorageMessage) {
+		let logger = WithContext::from(&self.logger, Some(*counterparty_node_id), None, None);
+		if msg.data.len() < 16 {
+			log_debug!(logger, "Invalid YourPeerStorage received from {}", log_pubkey!(counterparty_node_id));
+			return;
+		}
+
+ 		let mut res = vec![0; msg.data.len() - 16];
+		let mut cyphertext_with_key = Vec::with_capacity(msg.data.len() + self.our_peerstorage_encryption_key.len());
+		cyphertext_with_key.extend(msg.data.clone());
+		cyphertext_with_key.extend_from_slice(&self.our_peerstorage_encryption_key);
+
+		match OurPeerStorage::decrypt_our_peer_storage(&mut res, cyphertext_with_key.as_slice()) {
+			Ok(()) => {
+				// Decryption successful, the plaintext is now stored in `res`
+				log_debug!(logger, "Received a peer storage from peer {}", log_pubkey!(counterparty_node_id));
+			}
+			Err(_) => {
+				log_debug!(logger, "Invalid YourPeerStorage received from {}", log_pubkey!(counterparty_node_id));
+				return;
+			}
+		}
+
+		let our_peer_storage = <OurPeerStorage as Readable>::read(&mut ::bitcoin::io::Cursor::new(res)).unwrap();
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		
+		for ((node_id, channel_id), min_seen_secret) in our_peer_storage.get_cid_and_min_seen_secret().unwrap() {
+			let peer_state_mutex = match per_peer_state.get(&node_id) {
+				Some(mutex) => mutex,
+				None => {
+					log_debug!(logger, "Not able to find peer_state for the counterparty {}, channelId {}", log_pubkey!(node_id), channel_id);
+					continue;
+				}
+			};
+
+			let peer_state_lock = peer_state_mutex.lock().unwrap();
+			let peer_state = &*peer_state_lock;
+
+			match peer_state.channel_by_id.get(&channel_id) {
+				Some(ChannelPhase::Funded(chan)) => {
+					if chan.context.get_commitment_secret().get_min_seen_secret() > min_seen_secret {
+						panic!("Lost channel state for channel {}.
+								Received peer storage with a more recent state than what our node had.
+								Use the FundRecoverer to initiate a force close and sweep the funds.", channel_id);
+					}
+				},
+				Some(_) => {}
+				None => {
+					continue;
+				}
+			}
+		}
 	}
 
 	fn internal_funding_signed(&self, counterparty_node_id: &PublicKey, msg: &msgs::FundingSigned) -> Result<(), MsgHandleErrInternal> {
@@ -8005,7 +8086,18 @@ where
 						let mut pending_events = self.pending_events.lock().unwrap();
 						emit_channel_ready_event!(pending_events, chan);
 					}
-
+					// Update Peer Storage.
+					// let counterparty_channel_parameters = chan.context.channel_transaction_parameters.counterparty_parameters.as_ref().unwrap();
+					// let counterparty_delayed_payment_base_key = counterparty_channel_parameters.pubkeys.delayed_payment_basepoint;
+					// let counterparty_htlc_base_key = counterparty_channel_parameters.pubkeys.htlc_basepoint;
+					// let stub_chan = StubChannelMonitor::new(chan.context.channel_id(), chan.context.get_funding_txo().unwrap(), chan.context.get_value_satoshis(),
+					// 											chan.context.get_channel_keys_id(), chan.context.get_commitment_secret(),
+					// 											chan.context.get_counterparty_node_id(), counterparty_delayed_payment_base_key, counterparty_htlc_base_key,
+					// 											chan.context.get_holder_selected_contest_delay(),
+					// 											chan.context.get_commitment_txn_number_obscure_factor(), None,
+					// 											None, chan.context.channel_transaction_parameters.channel_type_features.clone(),
+					// 											self.current_best_block());
+					// self.our_peer_storage.write().unwrap().stub_channel(stub_chan);
 					Ok(())
 				} else {
 					try_chan_phase_entry!(self, Err(ChannelError::close(
@@ -8353,6 +8445,7 @@ where
 					let funding_txo = chan.context.get_funding_txo();
 					let monitor_update_opt = try_chan_phase_entry!(self, chan.commitment_signed(&msg, &&logger), chan_phase_entry);
 					if let Some(monitor_update) = monitor_update_opt {
+						// let _ = self.our_peer_storage.write().unwrap().update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
 						handle_new_monitor_update!(self, funding_txo.unwrap(), monitor_update, peer_state_lock,
 							peer_state, per_peer_state, chan);
 					}
@@ -8899,6 +8992,7 @@ where
 						}
 						if let Some(monitor_update) = monitor_opt {
 							has_monitor_update = true;
+							// let _ = self.our_peer_storage.write().unwrap().update_state_from_monitor_update(chan.context.channel_id(), monitor_update.clone());
 
 							handle_new_monitor_update!(self, funding_txo.unwrap(), monitor_update,
 								peer_state_lock, peer_state, per_peer_state, chan);
@@ -10136,7 +10230,7 @@ where
 			}
 			channel.best_block_updated(height, header.time, self.chain_hash, &self.node_signer, &self.default_configuration, &&WithChannelContext::from(&self.logger, &channel.context, None))
 		});
-
+		// self.our_peer_storage.write().unwrap().update_best_block(header, height);
 		macro_rules! max_time {
 			($timestamp: expr) => {
 				loop {
@@ -10880,7 +10974,6 @@ where
 						},
 					});
 				}
-
 
 				for (_, phase) in peer_state.channel_by_id.iter_mut() {
 					match phase {
@@ -12319,6 +12412,8 @@ where
 		let mut channel_closures = VecDeque::new();
 		let mut close_background_events = Vec::new();
 		let mut funding_txo_to_channel_id = hash_map_with_capacity(channel_count as usize);
+		let mut our_peer_storage: OurPeerStorage = OurPeerStorage::new();
+
 		for _ in 0..channel_count {
 			let mut channel: Channel<SP> = Channel::read(reader, (
 				&args.entropy_source, &args.signer_provider, best_block_height, &provided_channel_type_features(&args.default_config)
@@ -12327,7 +12422,38 @@ where
 			let funding_txo = channel.context.get_funding_txo().ok_or(DecodeError::InvalidValue)?;
 			funding_txo_to_channel_id.insert(funding_txo, channel.context.channel_id());
 			funding_txo_set.insert(funding_txo.clone());
+			let counterparty_channel_parameters = channel.context.channel_transaction_parameters.counterparty_parameters.as_ref().unwrap();
+			let counterparty_delayed_payment_base_key = counterparty_channel_parameters.pubkeys.delayed_payment_basepoint;
+			let counterparty_htlc_base_key = counterparty_channel_parameters.pubkeys.htlc_basepoint;
+
+			// let stub_chan = StubChannelMonitor::new(
+			// 	channel.context.channel_id(),
+			// 	funding_txo,
+			// 	channel.context.get_value_satoshis(),
+			// 	channel.context.get_channel_keys_id(),
+			// 	channel.context.get_commitment_secret(),
+			// 	channel.context.get_counterparty_node_id(),
+			// 	counterparty_delayed_payment_base_key,
+			// 	counterparty_htlc_base_key,
+			// 	channel.context.get_holder_selected_contest_delay(),
+			// 	channel.context.get_commitment_txn_number_obscure_factor(),
+			// 	None,
+			// 	None,
+			// 	channel.context.channel_transaction_parameters.channel_type_features.clone(),
+			// 	BestBlock::new(best_block_hash.clone(), best_block_height.clone()),
+			// );
+			// our_peer_storage.stub_channel(stub_chan);
 			if let Some(ref mut monitor) = args.channel_monitors.get_mut(&funding_txo) {
+				if let Some(latest_commitment_txn_info) = monitor.get_latest_commitment_txn_and_its_claiming_info() {
+
+					// our_peer_storage.update_latest_state(monitor.channel_id(), latest_commitment_txn_info.0, latest_commitment_txn_info.2);
+				}
+
+				if monitor.get_latest_update_id() == STUB_CHANNEL_UPDATE_IDENTIFIER {
+					log_error!(logger, "ChannelMonitor for {} is stale and recovered from Peer Storage, it is not safe to run the node in normal mode.", monitor.channel_id());
+					return Err(DecodeError::DangerousValue);
+				}
+
 				if channel.get_cur_holder_commitment_transaction_number() > monitor.get_cur_holder_commitment_number() ||
 						channel.get_revoked_counterparty_commitment_transaction_number() > monitor.get_min_seen_secret() ||
 						channel.get_cur_counterparty_commitment_transaction_number() > monitor.get_cur_counterparty_commitment_number() ||
@@ -12893,6 +13019,7 @@ where
 
 		let inbound_pmt_key_material = args.node_signer.get_inbound_payment_key_material();
 		let expanded_inbound_key = inbound_payment::ExpandedKey::new(&inbound_pmt_key_material);
+		let our_peerstorage_encryption_key = args.node_signer.get_peer_storage_key();
 
 		let mut claimable_payments = hash_map_with_capacity(claimable_htlcs_list.len());
 		if let Some(purposes) = claimable_htlc_purposes {
@@ -13118,6 +13245,7 @@ where
 			best_block: RwLock::new(BestBlock::new(best_block_hash, best_block_height)),
 
 			inbound_payment_key: expanded_inbound_key,
+			our_peerstorage_encryption_key,
 			pending_inbound_payments: Mutex::new(pending_inbound_payments),
 			pending_outbound_payments: pending_outbounds,
 			pending_intercepted_htlcs: Mutex::new(pending_intercepted_htlcs.unwrap()),
@@ -13162,6 +13290,7 @@ where
 
 			last_days_feerates: Mutex::new(VecDeque::new()),
 
+			our_peer_storage: FairRwLock::new(our_peer_storage),
 			logger: args.logger,
 			default_configuration: args.default_config,
 		};
