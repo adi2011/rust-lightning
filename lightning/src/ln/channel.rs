@@ -2074,6 +2074,10 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		self.update_time_counter
 	}
 
+	pub fn get_commitment_secret(&self) -> CounterpartyCommitmentSecrets {
+		self.commitment_secrets.clone()
+	}
+
 	pub fn get_latest_monitor_update_id(&self) -> u64 {
 		self.latest_monitor_update_id
 	}
@@ -2372,7 +2376,7 @@ impl<SP: Deref> ChannelContext<SP> where SP::Target: SignerProvider  {
 		height.checked_sub(self.funding_tx_confirmation_height).map_or(0, |c| c + 1)
 	}
 
-	fn get_holder_selected_contest_delay(&self) -> u16 {
+	pub fn get_holder_selected_contest_delay(&self) -> u16 {
 		self.channel_transaction_parameters.holder_selected_contest_delay
 	}
 
